@@ -93,7 +93,11 @@ impl<'a> Link<'a> {
     }
 
     fn display(&self) -> String {
-        format!("{}:{}", self.prefix.unwrap_or(""), self.path)
+        format!(
+            "{}{}",
+            self.prefix.map(|s| format!("{}:", s)).unwrap_or_default(),
+            self.path
+        )
     }
 }
 
@@ -144,18 +148,18 @@ impl<'a> Wiki<'a> {
         let replace = |caps: &Captures| {
             let origin = caps[0].to_owned();
             let prefix = caps.name("prefix").map(|m| m.as_str());
-            let path = &caps.name("path").expect("Should captured with name link");
+            let path = caps.name("path").expect("Should captured with name link");
             let link = Link::new(prefix, path.as_str());
 
             if &self.get_absolute_path(&link) != from {
                 return origin;
             }
 
-            let left = &caps
+            let left = caps
                 .name("left")
                 .expect("Should captured with left side of link")
                 .as_str();
-            let right = &caps
+            let right = caps
                 .name("right")
                 .expect("Should captured with right side of link")
                 .as_str();
@@ -169,12 +173,7 @@ impl<'a> Wiki<'a> {
                     .map(|relative_path| {
                         prefix
                             .filter(|s| *s != "diary")
-                            .map(|s| {
-                                let mut s = s.to_owned();
-                                s.push(':');
-                                s.push_str(&relative_path);
-                                s
-                            })
+                            .map(|s| format!("{}:{}", s, relative_path))
                             .unwrap_or_else(|| relative_path.to_owned())
                     })
                     .unwrap_or_else(|| link.display())
@@ -186,7 +185,7 @@ impl<'a> Wiki<'a> {
                 if right.starts_with('|') {
                     format!(" {}", right)
                 } else {
-                    (*right).to_string()
+                    right.to_string()
                 }
             )
         };
