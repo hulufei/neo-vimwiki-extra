@@ -1,8 +1,9 @@
 use anyhow;
 use fehler::throws;
-use path_clean::{clean, PathClean};
+use path_clean::PathClean;
 use pathdiff::diff_paths;
 use regex::{Captures, Regex};
+use std::fs::{self, DirEntry};
 use std::path::{Path, PathBuf};
 
 // Currently not support:
@@ -139,14 +140,14 @@ impl<'a> Wiki<'a> {
         .and_then(|p| p.to_str().map(String::from))
     }
 
-    fn replace_links(&self, content: &str, from: AbsolutePath, to: AbsolutePath) -> String {
+    fn replace_links(&self, content: &str, from: &AbsolutePath, to: &AbsolutePath) -> String {
         let replace = |caps: &Captures| {
             let origin = caps[0].to_owned();
             let prefix = caps.name("prefix").map(|m| m.as_str());
             let path = &caps.name("path").expect("Should captured with name link");
             let link = Link::new(prefix, path.as_str());
 
-            if self.get_absolute_path(&link) != from {
+            if &self.get_absolute_path(&link) != from {
                 return origin;
             }
 
@@ -193,10 +194,43 @@ impl<'a> Wiki<'a> {
         let content = DEFAULT_LINK_RE.replace_all(&content, replace);
         WIKI_INCLUDE_RE.replace_all(&content, replace).into_owned()
     }
+
+    #[throws]
+    fn update_links(&self, from: &AbsolutePath, to: &AbsolutePath) {
+        let content = fs::read_to_string(self.content_path)?;
+        let updated_content = self.replace_links(&content, from, to);
+        fs::write(self.content_path, updated_content)?;
+    }
 }
 
-pub fn rename(wiki_root: PathBuf, old_path: PathBuf, new_name: &str) {
-    unimplemented!()
+// one possible implementation of walking a directory only visiting files
+#[throws]
+fn visit_dirs(dir: &Path, cb: &dyn Fn(&DirEntry)) {
+    if dir.is_dir() {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                visit_dirs(&path, cb)?;
+            } else {
+                cb(&entry);
+            }
+        }
+    }
+}
+
+pub fn rename(wiki_root: PathBuf, from: &str, to: &str) {
+    let from_path = AbsolutePath::new(from);
+    let to_path = AbsolutePath::new(to);
+    let update_links = |entry: &DirEntry| {
+        let content_path = entry.path();
+        let wiki = Wiki::new(&wiki_root, &content_path);
+        match wiki.update_links(&from_path, &to_path) {
+            Ok(_) => (),
+            Err(e) => panic!("Update wiki {} failed: {}", content_path.display(), e),
+        }
+    };
+    visit_dirs(&wiki_root, &update_links);
 }
 
 #[cfg(test)]
@@ -289,11 +323,7 @@ mod test_links_regex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow;
-    use fehler::throws;
-    use std::path::{Path, PathBuf};
-
-    type Error = anyhow::Error;
+    use std::path::PathBuf;
 
     lazy_static! {
         static ref WIKI_ROOT: PathBuf = PathBuf::from("/dropbox/vimwiki");
@@ -309,8 +339,8 @@ mod tests {
         assert_eq!(
             wiki.replace_links(
                 content,
-                AbsolutePath::new("/dropbox/vimwiki/diary/2010-01-01.md"),
-                AbsolutePath::new("/dropbox/vimwiki/diary/2020-02-02.md")
+                &AbsolutePath::new("/dropbox/vimwiki/diary/2010-01-01.md"),
+                &AbsolutePath::new("/dropbox/vimwiki/diary/2020-02-02.md")
             ),
             r#"
         Here is a [diary](diary:2020-02-02).
@@ -327,8 +357,8 @@ mod tests {
         assert_eq!(
             wiki.replace_links(
                 content,
-                AbsolutePath::new("/dropbox/vimwiki/diary/2010-01-01.md"),
-                AbsolutePath::new("/dropbox/vimwiki/non-dairy.md")
+                &AbsolutePath::new("/dropbox/vimwiki/diary/2010-01-01.md"),
+                &AbsolutePath::new("/dropbox/vimwiki/non-dairy.md")
             ),
             r#"
         Here is a [diary](../non-dairy).
@@ -345,8 +375,8 @@ mod tests {
         assert_eq!(
             wiki.replace_links(
                 content,
-                AbsolutePath::new("/dropbox/vimwiki/link.md"),
-                AbsolutePath::new("/dropbox/vimwiki/renamed.md")
+                &AbsolutePath::new("/dropbox/vimwiki/link.md"),
+                &AbsolutePath::new("/dropbox/vimwiki/renamed.md")
             ),
             r#"
         Here is a [absolute to root](../renamed).
@@ -367,8 +397,8 @@ mod tests {
         assert_eq!(
             wiki.replace_links(
                 content,
-                AbsolutePath::new("/dropbox/vimwiki/books/link.md"),
-                AbsolutePath::new("/dropbox/vimwiki/books/renamed.md")
+                &AbsolutePath::new("/dropbox/vimwiki/books/link.md"),
+                &AbsolutePath::new("/dropbox/vimwiki/books/renamed.md")
             ),
             r#"
         - [local link relative link](local:renamed).
