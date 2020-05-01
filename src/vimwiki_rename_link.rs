@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 // Currently not support:
 // - Interwiki links
 // - Markdown reference-style links
-// diary:file:local:
 
 lazy_static! {
     static ref DEFAULT_LINK_RE: Regex = Regex::new(
@@ -97,13 +96,13 @@ impl<'a> Link<'a> {
     }
 }
 
-struct Wiki {
-    wiki_root: PathBuf,
-    content_path: PathBuf,
+struct Wiki<'a> {
+    wiki_root: &'a Path,
+    content_path: &'a Path,
 }
 
-impl<'a> Wiki {
-    fn new(wiki_root: PathBuf, content_path: PathBuf) -> Self {
+impl<'a> Wiki<'a> {
+    fn new(wiki_root: &'a Path, content_path: &'a Path) -> Self {
         Wiki {
             wiki_root,
             content_path,
@@ -111,24 +110,21 @@ impl<'a> Wiki {
     }
 
     fn get_absolute_path(&self, link: &Link) -> AbsolutePath {
-        let mut root;
-        match link.prefix {
-            Some("diary") => {
-                root = self.wiki_root.to_path_buf();
-                root.push("diary");
-            }
+        let link_path = link.path.trim_start_matches('/');
+        let path = match link.prefix {
+            Some("diary") => self.wiki_root.join("diary").join(link_path),
             _ => {
-                root = if link.path.starts_with('/') {
-                    self.wiki_root.to_path_buf()
+                if link.path.starts_with('/') {
+                    self.wiki_root.join(link_path)
                 } else {
                     self.content_path
                         .parent()
                         .expect("get_absolute_path: Wiki file should have a parent")
-                        .to_path_buf()
+                        .join(link_path)
                 }
             }
         };
-        AbsolutePath::new(root.join(link.path.trim_start_matches('/')))
+        AbsolutePath::new(path)
     }
 
     fn get_relative_path(&self, to: &AbsolutePath) -> Option<String> {
@@ -299,11 +295,14 @@ mod tests {
 
     type Error = anyhow::Error;
 
+    lazy_static! {
+        static ref WIKI_ROOT: PathBuf = PathBuf::from("/dropbox/vimwiki");
+        static ref CONTENT_PATH: PathBuf = PathBuf::from("/dropbox/vimwiki/books/note.md");
+    }
+
     #[test]
     fn it_replace_diary_links() {
-        let wiki_root = PathBuf::from("/dropbox/vimwiki");
-        let content_path = PathBuf::from("/dropbox/vimwiki/books/note.md");
-        let wiki = Wiki::new(wiki_root, content_path);
+        let wiki = Wiki::new(&WIKI_ROOT, &CONTENT_PATH);
         let content = r#"
         Here is a [diary](diary:2010-01-01).
         "#;
@@ -321,9 +320,7 @@ mod tests {
 
     #[test]
     fn it_replace_diary_links_to_non_dairy() {
-        let wiki_root = PathBuf::from("/dropbox/vimwiki");
-        let content_path = PathBuf::from("/dropbox/vimwiki/books/note.md");
-        let wiki = Wiki::new(wiki_root, content_path);
+        let wiki = Wiki::new(&WIKI_ROOT, &CONTENT_PATH);
         let content = r#"
         Here is a [diary](diary:2010-01-01).
         "#;
@@ -341,9 +338,7 @@ mod tests {
 
     #[test]
     fn it_replace_absolute_link() {
-        let wiki_root = PathBuf::from("/dropbox/vimwiki");
-        let content_path = PathBuf::from("/dropbox/vimwiki/books/note.md");
-        let wiki = Wiki::new(wiki_root, content_path);
+        let wiki = Wiki::new(&WIKI_ROOT, &CONTENT_PATH);
         let content = r#"
         Here is a [absolute to root](/link).
         "#;
@@ -361,9 +356,7 @@ mod tests {
 
     #[test]
     fn it_replace_all_matched_links() {
-        let wiki_root = PathBuf::from("/dropbox/vimwiki");
-        let content_path = PathBuf::from("/dropbox/vimwiki/books/note.md");
-        let wiki = Wiki::new(wiki_root, content_path);
+        let wiki = Wiki::new(&WIKI_ROOT, &CONTENT_PATH);
         let content = r#"
         - [local link relative link](local:./link).
         - [file link](file:link).
