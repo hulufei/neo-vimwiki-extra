@@ -13,16 +13,16 @@ use std::path::{Path, PathBuf};
 lazy_static! {
     static ref DEFAULT_LINK_RE: Regex = Regex::new(
         r"(?x)
-        (?P<left>\[\[)
-        ((?P<prefix>diary|file|local):)?(?P<path>(?-x:[^#|]+))
+        (?P<left>\[\[\s*)
+        ((?P<prefix>diary|file|local):)?(?P<path>(?-x:[^#|]+?))
         (?P<right>(?-x:#.*)?(\|.*)*\]\])
     "
     )
     .unwrap();
     static ref WIKI_INCLUDE_RE: Regex = Regex::new(
         r"(?x)
-        (?P<left>\{\{)
-        ((?P<prefix>diary|file|local):)?(?P<path>(?-x:[^#|]+))
+        (?P<left>\{\{\s*)
+        ((?P<prefix>diary|file|local):)?(?P<path>(?-x:[^#|]+?))
         (?P<right>(?-x:#.*)?(\|.*)*\}\})
     "
     )
@@ -30,7 +30,7 @@ lazy_static! {
     static ref MD_LINK_RE: Regex = Regex::new(
         r"(?x)
         (?P<left>\[.*\]\()
-        ((?P<prefix>diary|file|local):)?(?P<path>(?-x:[^#|]+))
+        ((?P<prefix>diary|file|local):)?(?P<path>(?-x:[^#|]+?))
         (?P<right>(?-x:#.*)?\))
     "
     )
@@ -40,6 +40,45 @@ lazy_static! {
 #[allow(dead_code)]
 type Error = anyhow::Error;
 
+struct AbsolutePath {
+    path: PathBuf,
+}
+
+impl AbsolutePath {
+    fn new<P: AsRef<Path>>(path: P) -> Self {
+        Self {
+            path: path.as_ref().to_path_buf().clean(),
+        }
+    }
+
+    fn is_in_diary(&self) -> bool {
+        self.path
+            .to_str()
+            .map(|s| s.contains("/diary/"))
+            .unwrap_or(false)
+    }
+
+    fn get_path(&self) -> &Path {
+        &self.path
+    }
+
+    fn get_file_name(&self) -> Option<String> {
+        self.path
+            .with_extension("")
+            .file_name()
+            .and_then(|x| x.to_str().map(String::from))
+    }
+}
+
+impl PartialEq for AbsolutePath {
+    fn eq(&self, other: &Self) -> bool {
+        match (self.path.extension(), other.path.extension()) {
+            (Some(_), Some(_)) => self.path == other.path,
+            _ => self.path.with_extension("") == other.path.with_extension(""),
+        }
+    }
+}
+
 struct Link<'a> {
     prefix: Option<&'a str>,
     path: &'a str,
@@ -47,28 +86,14 @@ struct Link<'a> {
 
 impl<'a> Link<'a> {
     fn new(prefix: Option<&'a str>, path: &'a str) -> Self {
-        Self { prefix, path }
+        Self {
+            prefix,
+            path: path.trim(),
+        }
     }
 
-    fn get_full_path(&self, wiki_root: &Path, content_path: &Path) -> PathBuf {
-        let mut root;
-        match self.prefix {
-            Some("diary") => {
-                root = wiki_root.to_path_buf();
-                root.push("diary");
-            }
-            _ => {
-                root = content_path
-                    .parent()
-                    .expect("Wiki file should have a parent")
-                    .to_path_buf();
-            }
-        };
-        root.join(self.path.trim_start_matches('/')).clean()
-    }
-
-    fn is_in_diary(path: &str) -> bool {
-        clean(path).contains("/diary/")
+    fn display(&self) -> String {
+        format!("{}:{}", self.prefix.unwrap_or(""), self.path)
     }
 }
 
@@ -85,70 +110,88 @@ impl<'a> Wiki {
         }
     }
 
-    fn get_relative_link_to(&self, renamed_link_full_path: &str) -> Option<PathBuf> {
+    fn get_absolute_path(&self, link: &Link) -> AbsolutePath {
+        let mut root;
+        match link.prefix {
+            Some("diary") => {
+                root = self.wiki_root.to_path_buf();
+                root.push("diary");
+            }
+            _ => {
+                root = if link.path.starts_with('/') {
+                    self.wiki_root.to_path_buf()
+                } else {
+                    self.content_path
+                        .parent()
+                        .expect("get_absolute_path: Wiki file should have a parent")
+                        .to_path_buf()
+                }
+            }
+        };
+        AbsolutePath::new(root.join(link.path.trim_start_matches('/')))
+    }
+
+    fn get_relative_path(&self, to: &AbsolutePath) -> Option<String> {
         // Strip file extension
-        let renamed_link_full_path = PathBuf::from(renamed_link_full_path).with_extension("");
-        diff_paths(renamed_link_full_path, &self.content_path)
+        diff_paths(
+            to.get_path().with_extension(""),
+            &self
+                .content_path
+                .parent()
+                .expect("get_relative_path: Wiki file should have a parent"),
+        )
+        .and_then(|p| p.to_str().map(String::from))
     }
 
-    fn get_renamed_diary_link(&self, renamed_link_full_path: &str) -> Option<PathBuf> {
-        // Strip file extension
-        let renamed_link_full_path = PathBuf::from(renamed_link_full_path).with_extension("");
-        let mut root = self.wiki_root.to_path_buf();
-        root.push("diary");
-        renamed_link_full_path
-            .strip_prefix(root)
-            .map(PathBuf::from)
-            .ok()
-    }
-
-    fn is_equal_link(&self, link: Link, compare_to_link_full_path: &str) -> bool {
-        let compare_to_link = PathBuf::from(compare_to_link_full_path);
-        let mut link_path = link.get_full_path(&self.wiki_root, &self.content_path);
-        if let Some(extension) = compare_to_link.extension() {
-            link_path = link_path.with_extension(extension);
-        }
-        link_path == compare_to_link
-    }
-
-    fn replace_links(
-        &self,
-        content: &str,
-        old_link_full_path: &str,
-        renamed_link_full_path: &str,
-    ) -> String {
-        let relative_path_to_renamed_link = self
-            .get_relative_link_to(dbg!(renamed_link_full_path))
-            .expect("Should get renamed relative link PathBuf");
-        let relative_path_to_renamed_link = dbg!(relative_path_to_renamed_link
-            .to_str()
-            .expect("Should get renamed relative link path str"));
+    fn replace_links(&self, content: &str, from: AbsolutePath, to: AbsolutePath) -> String {
         let replace = |caps: &Captures| {
+            let origin = caps[0].to_owned();
             let prefix = caps.name("prefix").map(|m| m.as_str());
             let path = &caps.name("path").expect("Should captured with name link");
+            let link = Link::new(prefix, path.as_str());
+
+            if self.get_absolute_path(&link) != from {
+                return origin;
+            }
+
             let left = &caps
                 .name("left")
-                .expect("Should captured with left side of link");
+                .expect("Should captured with left side of link")
+                .as_str();
             let right = &caps
                 .name("right")
-                .expect("Should captured with right side of link");
-            if self.is_equal_link(Link::new(prefix, path.as_str()), old_link_full_path) {
-                format!(
-                    "{}{}{}{}",
-                    dbg!(left.as_str()),
-                    prefix
-                        .map(|s| {
-                            let mut s = s.to_owned();
-                            s.push(':');
-                            s
-                        })
-                        .unwrap_or("".to_owned()),
-                    dbg!(relative_path_to_renamed_link),
-                    dbg!(right.as_str())
-                )
+                .expect("Should captured with right side of link")
+                .as_str();
+
+            let replaced = if to.is_in_diary() {
+                to.get_file_name()
+                    .map(|file_name| format!("diary:{}", file_name))
+                    .unwrap_or_else(|| link.display())
             } else {
-                caps[0].to_owned()
-            }
+                self.get_relative_path(&to)
+                    .map(|relative_path| {
+                        prefix
+                            .filter(|s| *s != "diary")
+                            .map(|s| {
+                                let mut s = s.to_owned();
+                                s.push(':');
+                                s.push_str(&relative_path);
+                                s
+                            })
+                            .unwrap_or_else(|| relative_path.to_owned())
+                    })
+                    .unwrap_or_else(|| link.display())
+            };
+            format!(
+                "{}{}{}",
+                left,
+                replaced,
+                if right.starts_with('|') {
+                    format!(" {}", right)
+                } else {
+                    (*right).to_string()
+                }
+            )
         };
         let content = MD_LINK_RE.replace_all(content, replace);
         let content = DEFAULT_LINK_RE.replace_all(&content, replace);
@@ -257,86 +300,89 @@ mod tests {
     type Error = anyhow::Error;
 
     #[test]
-    fn it_get_diary_link_full_path() {
-        let link = Link::new(Some("diary"), "2020-01-01");
-        let wiki_root = PathBuf::from("/dropbox/vimwiki");
-        let content_path = PathBuf::from("/dropbox/vimwiki/index.md");
-        assert_eq!(
-            link.get_full_path(&wiki_root, &content_path),
-            PathBuf::from("/dropbox/vimwiki/diary/2020-01-01")
-        );
-    }
-
-    #[test]
-    fn it_generate_local_file_plain_links() {
-        let link = Link::new(Some("diary"), "2020-01-01");
-        let wiki_root = PathBuf::from("/dropbox/vimwiki");
-        let content_path = PathBuf::from("/dropbox/vimwiki/index.md");
-        assert_eq!(
-            Link::new(Some("local"), "images/screen.png").get_full_path(&wiki_root, &content_path),
-            PathBuf::from("/dropbox/vimwiki/images/screen.png")
-        );
-        assert_eq!(
-            Link::new(Some("file"), "images/screen.png").get_full_path(&wiki_root, &content_path),
-            PathBuf::from("/dropbox/vimwiki/images/screen.png")
-        );
-        assert_eq!(
-            Link::new(None, "note.md").get_full_path(&wiki_root, &content_path),
-            PathBuf::from("/dropbox/vimwiki/note.md")
-        );
-    }
-
-    #[test]
-    fn it_generate_with_absolute_link() {
-        let wiki_root = PathBuf::from("/dropbox/vimwiki");
-        let content_path = PathBuf::from("/dropbox/vimwiki/index.md");
-        assert_eq!(
-            Link::new(None, "/note.md").get_full_path(&wiki_root, &content_path),
-            PathBuf::from("/dropbox/vimwiki/note.md")
-        );
-    }
-
-    #[test]
-    fn it_should_check_equal_to_full_link_path() {
-        let wiki_root = PathBuf::from("/dropbox/vimwiki");
-        let content_path = PathBuf::from("/dropbox/vimwiki/books/index.md");
-        let link_factory = Wiki::new(wiki_root, content_path);
-        assert!(
-            link_factory.is_equal_link(Link::new(None, "../note.md"), "/dropbox/vimwiki/note.md")
-        );
-        assert!(link_factory.is_equal_link(Link::new(None, "../note"), "/dropbox/vimwiki/note.md"));
-    }
-
-    #[test]
-    fn it_get_link_relative_to_content() {
-        let wiki_root = PathBuf::from("/dropbox/vimwiki");
-        let content_path = PathBuf::from("/dropbox/vimwiki/books/index.md");
-        let link_factory = Wiki::new(wiki_root, content_path);
-        assert_eq!(
-            link_factory.get_relative_link_to("/dropbox/vimwiki/note.md"),
-            Some(PathBuf::from("../../note"))
-        );
-    }
-
-    #[test]
     fn it_replace_diary_links() {
         let wiki_root = PathBuf::from("/dropbox/vimwiki");
-        // let content_path = PathBuf::from("/dropbox/vimwiki/diary/yyyy-mm-dd.md");
         let content_path = PathBuf::from("/dropbox/vimwiki/books/note.md");
-        let link_factory = Wiki::new(wiki_root, content_path);
+        let wiki = Wiki::new(wiki_root, content_path);
         let content = r#"
         Here is a [diary](diary:2010-01-01).
-        rename to whatever
         "#;
         assert_eq!(
-            link_factory.replace_links(
+            wiki.replace_links(
                 content,
-                "/dropbox/vimwiki/diary/2010-01-01.md",
-                "/dropbox/vimwiki/diary/2020-02-02.md"
+                AbsolutePath::new("/dropbox/vimwiki/diary/2010-01-01.md"),
+                AbsolutePath::new("/dropbox/vimwiki/diary/2020-02-02.md")
             ),
             r#"
         Here is a [diary](diary:2020-02-02).
-        rename to whatever
+        "#
+        );
+    }
+
+    #[test]
+    fn it_replace_diary_links_to_non_dairy() {
+        let wiki_root = PathBuf::from("/dropbox/vimwiki");
+        let content_path = PathBuf::from("/dropbox/vimwiki/books/note.md");
+        let wiki = Wiki::new(wiki_root, content_path);
+        let content = r#"
+        Here is a [diary](diary:2010-01-01).
+        "#;
+        assert_eq!(
+            wiki.replace_links(
+                content,
+                AbsolutePath::new("/dropbox/vimwiki/diary/2010-01-01.md"),
+                AbsolutePath::new("/dropbox/vimwiki/non-dairy.md")
+            ),
+            r#"
+        Here is a [diary](../non-dairy).
+        "#
+        );
+    }
+
+    #[test]
+    fn it_replace_absolute_link() {
+        let wiki_root = PathBuf::from("/dropbox/vimwiki");
+        let content_path = PathBuf::from("/dropbox/vimwiki/books/note.md");
+        let wiki = Wiki::new(wiki_root, content_path);
+        let content = r#"
+        Here is a [absolute to root](/link).
+        "#;
+        assert_eq!(
+            wiki.replace_links(
+                content,
+                AbsolutePath::new("/dropbox/vimwiki/link.md"),
+                AbsolutePath::new("/dropbox/vimwiki/renamed.md")
+            ),
+            r#"
+        Here is a [absolute to root](../renamed).
+        "#
+        );
+    }
+
+    #[test]
+    fn it_replace_all_matched_links() {
+        let wiki_root = PathBuf::from("/dropbox/vimwiki");
+        let content_path = PathBuf::from("/dropbox/vimwiki/books/note.md");
+        let wiki = Wiki::new(wiki_root, content_path);
+        let content = r#"
+        - [local link relative link](local:./link).
+        - [file link](file:link).
+        - [reserve link](other)
+        - [[link | default wiki link]]
+        - {{ link | transclusion link }}
+        "#;
+        assert_eq!(
+            wiki.replace_links(
+                content,
+                AbsolutePath::new("/dropbox/vimwiki/books/link.md"),
+                AbsolutePath::new("/dropbox/vimwiki/books/renamed.md")
+            ),
+            r#"
+        - [local link relative link](local:renamed).
+        - [file link](file:renamed).
+        - [reserve link](other)
+        - [[renamed | default wiki link]]
+        - {{ renamed | transclusion link }}
         "#
         );
     }
